@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Asistente de La Chancla</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <h1>Asistente de La Chancla</h1>
+  <form method="POST" action="/preguntar">
+    
+
+    <input type="text" name="pregunta" placeholder="Haz tu pregunta..." style="width: 400px;" required>
+    <button type="submit">Preguntar</button>
+  </form>
+
+  {% if respuesta %}
+    <h2>Respuesta:</h2>
+    <p>{{ respuesta }}</p>
+  {% endif %}
+</body>
+</html>
