@@ -6,3 +6,4 @@ gunicorn
 scikit-learn
 markdown
 python-docx
+openpyxl
