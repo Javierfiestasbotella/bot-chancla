@@ -10,7 +10,7 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from lector_pdf import leer_todos_los_pdfs_en_fragmentos
 
-# TF-IDF
+# TF-IDF y similitud
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import linear_kernel
 
@@ -20,24 +20,20 @@ import markdown
 # Word (pendientes)
 from docx import Document
 
-# Excel
-from openpyxl import load_workbook
-
 # =========================
-# Utilidades: sanitizar texto
+# Utilidades
 # =========================
 def safe_text(s: str) -> str:
+    """Elimina caracteres problemáticos (surrogates/emoji) para evitar errores de UTF-8."""
     if s is None:
         return ""
     return s.encode("utf-8", "ignore").decode("utf-8", "ignore")
 
-# Troceo con solape
 def chunk_text(text, size=900, overlap=200):
     text = safe_text(text)
     if len(text) <= size:
         return [text]
-    chunks = []
-    start = 0
+    chunks, start = [], 0
     while start < len(text):
         end = start + size
         chunks.append(text[start:end])
@@ -60,6 +56,8 @@ model = genai.GenerativeModel("gemini-1.5-pro-latest")
 # =========================
 # Carga de documentos (PDF + XLSX)
 # =========================
+from openpyxl import load_workbook
+
 def leer_todos_los_xlsx_en_fragmentos(carpeta):
     frags = []
     for root, _, files in os.walk(carpeta):
@@ -70,7 +68,6 @@ def leer_todos_los_xlsx_en_fragmentos(carpeta):
                     wb = load_workbook(path, data_only=True)
                     for sheet_name in wb.sheetnames:
                         ws = wb[sheet_name]
-                        # Convertimos hoja a texto simple
                         lines = []
                         for row in ws.iter_rows(values_only=True):
                             vals = [str(v) for v in row if v is not None]
@@ -80,11 +77,9 @@ def leer_todos_los_xlsx_en_fragmentos(carpeta):
                         for ch in chunk_text(text, size=1000, overlap=250):
                             frags.append(safe_text(ch))
                 except Exception as e:
-                    # Si una hoja falla, seguimos con el resto
                     frags.append(safe_text(f"[DOC ERROR {fn}] {e}"))
     return frags
 
-# Leemos PDFs (función existente) + XLSX
 _fragmentos_pdf = leer_todos_los_pdfs_en_fragmentos("data/pdf_data")
 _fragmentos_xlsx = leer_todos_los_xlsx_en_fragmentos("data/pdf_data")
 fragmentos = [safe_text(f) for f in (_fragmentos_pdf + _fragmentos_xlsx)]
@@ -94,7 +89,7 @@ if not fragmentos:
 app = Flask(__name__)
 
 # =========================
-# Persistencia pendientes
+# Persistencia de pendientes
 # =========================
 LEES_DIR = "lees_resp"
 LEES_DOCX = os.path.join(LEES_DIR, "respuestas.docx")
@@ -121,7 +116,7 @@ def anotar_pendiente(pregunta: str, motivo: str, contexto_preview: str = ""):
     doc.save(LEES_DOCX)
 
 # =========================
-# Catálogo de vinos (parse desde fragmentos)
+# Catálogo de vinos (desde fragmentos)
 # =========================
 def construir_catalogo_vinos(fragmentos):
     vinos = []
@@ -137,19 +132,14 @@ def construir_catalogo_vinos(fragmentos):
                         name = cand
                     j -= 1
                 do = line.replace("📍", "").strip()
-                uvas, crianza, nota = "", "", ""
+                uvas = crianza = nota = ""
                 k = i + 1
                 while k < len(lines):
                     l2 = lines[k]
-                    if "📍" in l2:
-                        break
-                    if l2.startswith("🍇"):
-                        uvas = l2.replace("🍇", "").strip()
-                    elif l2.startswith("🛢"):
-                        crianza = l2.replace("🛢", "").strip()
-                    else:
-                        if l2:
-                            nota = (nota + " " + l2).strip() if nota else l2
+                    if "📍" in l2: break
+                    if l2.startswith("🍇"): uvas = l2.replace("🍇", "").strip()
+                    elif l2.startswith("🛢"): crianza = l2.replace("🛢", "").strip()
+                    elif l2: nota = (nota + " " + l2).strip() if nota else l2
                     k += 1
                 def clean(x): return safe_text(re.sub(r"\s{2,}", " ", x))
                 name, do, uvas, crianza, nota = map(clean, [name, do, uvas, crianza, nota])
@@ -159,8 +149,7 @@ def construir_catalogo_vinos(fragmentos):
     for v in vinos:
         n = v["nombre"].strip().lower()
         if n not in vistos:
-            vistos.add(n)
-            result.append(v)
+            vistos.add(n); result.append(v)
     return result
 
 CATALOGO_VINOS = construir_catalogo_vinos(fragmentos)
@@ -199,45 +188,84 @@ def es_pregunta_de_vinos(p):
     return any(c in p for c in claves)
 
 # =========================
-# Expansión de consulta (sinónimos del dominio)
+# Clasificación de tema + expansión de consulta
 # =========================
-SINONIMOS = {
-    "cierre": ["protocolo de cierre", "procedimiento de cierre", "recogida", "limpieza final", "cuadre de caja", "cierre de barra", "cierre de cocina"],
-    "cocina": ["cocinero", "cocineros", "chef", "pase", "partida", "mise en place"],
-    "hamaca": ["hamacas", "balinesas", "sombrillas", "tumbonas", "reserva de hamacas", "camas balinesas"],
-    "alergenos": ["alérgenos", "intolerancias"],
-    "horario": ["turnos", "apertura", "cierre"],
-    "pinganillo": ["walkie", "radio", "comunicación"],
-    "vinos": ["vino", "carta de vinos", "tinto", "blanco", "rosado", "rioja", "ribeiro", "ronda", "malagueño"]
+TOPICS = {
+    "staff": {"trabajador", "trabajadores", "personal", "camarero", "camareros", "cocina", "cocinero", "cocineros", "responsable", "encargado", "plantilla", "funciones"},
+    "uniform": {"uniforme", "vestimenta", "polo", "camiseta", "pantalon", "zapatos", "calzado", "zapatillas", "ropa"},
+    "payments": {"cobrar", "cobro", "pago", "pagos", "caja", "arqueo", "cierre", "tpv", "datofono", "datáfono", "efectivo", "tarjeta", "bizum", "factura", "ticket", "propina", "nidex"},
+    "schedule": {"horario", "turno", "turnos", "entrada", "llegada", "salida", "descanso", "viernes"},
+    "vinos": {"vino", "vinos", "tinto", "blanco", "rosado", "cava", "espumoso", "rioja", "ribeiro", "ronda", "malagueño"},
 }
 
-def expand_query(pregunta: str) -> str:
+EXPANSIONES = {
+    "payments": ["cuadre de caja", "cierre de caja", "arqueo", "cómo cobramos", "formas de pago", "facturación"],
+    "staff": ["equipo", "funciones del personal", "responsabilidades", "organización"],
+    "uniform": ["ropa de trabajo", "normas de vestimenta"],
+    "schedule": ["apertura", "cierre", "descansos"]
+}
+
+BEBIDAS_PRECIOS = {"refresco", "coca", "fanta", "aquarius", "nestea", "ginger", "bitter", "sangria", "cerveza", "botella", "copa", "jarra", "cafe", "té", "infusion"}
+
+def detectar_topic(pregunta: str) -> str:
     p = pregunta.lower()
-    extra = []
-    for clave, exps in SINONIMOS.items():
-        if clave in p:
-            extra += exps
-    return (pregunta + " " + " ".join(extra)).strip() if extra else pregunta
+    mejor = ""
+    puntos = 0
+    for t, kws in TOPICS.items():
+        score = sum(1 for k in kws if k in p)
+        if score > puntos:
+            mejor, puntos = t, score
+    return mejor
+
+def expand_query(pregunta: str, topic: str) -> str:
+    ex = EXPANSIONES.get(topic, [])
+    return (pregunta + " " + " ".join(ex)).strip() if ex else pregunta
+
+def es_fragmento_de_precios(frag: str) -> bool:
+    if "€" in frag: return True
+    if re.search(r"\d+,\d{2}\s*€", frag): return True
+    low = frag.lower()
+    return any(w in low for w in BEBIDAS_PRECIOS)
 
 # =========================
-# Búsqueda general (TF-IDF combinado)
+# Búsqueda con penalizaciones/bonos por tema
 # =========================
 def encontrar_fragmentos_relacionados(pregunta, fragmentos, max_resultados=8):
-    q = expand_query(pregunta)
-    # 1) Palabras (1-2 gramos)
+    topic = detectar_topic(pregunta)
+    q = expand_query(pregunta, topic)
+
+    # TF-IDF palabras (1-2gram) y caracteres (3-5) para robustez
     v_words = TfidfVectorizer(ngram_range=(1, 2), min_df=1)
-    tfidf_words = v_words.fit_transform(fragmentos + [q])
-    sims_words = linear_kernel(tfidf_words[-1], tfidf_words[:-1]).flatten()
-    # 2) Caracteres en ventana (3-5) para robustez ante variaciones
     v_char = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1)
-    tfidf_char = v_char.fit_transform(fragmentos + [q])
-    sims_char = linear_kernel(tfidf_char[-1], tfidf_char[:-1]).flatten()
-    # 3) Combinamos (media ponderada)
-    sims = 0.6 * sims_words + 0.4 * sims_char
-    top_idx = sims.argsort()[::-1][:max_resultados]
-    if sims[top_idx[0]] < 0.03:   # umbral bajo para no quedarnos sin nada
-        return fragmentos[:3]
-    return [fragmentos[i] for i in top_idx]
+
+    tfidf_w = v_words.fit_transform(fragmentos + [q])
+    tfidf_c = v_char.fit_transform(fragmentos + [q])
+
+    sims_w = linear_kernel(tfidf_w[-1], tfidf_w[:-1]).flatten()
+    sims_c = linear_kernel(tfidf_c[-1], tfidf_c[:-1]).flatten()
+    sims = 0.6 * sims_w + 0.4 * sims_c
+
+    # Ajustes por tema: bono por palabras del tema y penalización por “precios/bebidas”
+    ajustadas = []
+    for i, frag in enumerate(fragmentos):
+        score = sims[i]
+        low = frag.lower()
+        if topic in {"staff", "uniform", "payments"}:
+            if es_fragmento_de_precios(frag):
+                score -= 0.15
+        # bono si contiene alguna palabra del topic
+        for k in TOPICS.get(topic, []):
+            if k in low:
+                score += 0.05
+        ajustadas.append((score, i))
+
+    ajustadas.sort(key=lambda x: x[0], reverse=True)
+    top = ajustadas[:max_resultados]
+
+    # Si el mejor score es muy bajo, devolvemos vacío para forzar “No encontrado”
+    if not top or top[0][0] < 0.03:
+        return [], topic
+    return [fragmentos[i] for _, i in top], topic
 
 # =========================
 # Rutas
@@ -263,15 +291,21 @@ def preguntar():
             html = markdown.markdown(safe_text(md), extensions=["extra"])
             return render_template("index.html", pregunta=pregunta, respuesta=Markup(html))
 
-        # --- Rama general (TF-IDF + Gemini) ---
-        top_fragmentos = encontrar_fragmentos_relacionados(pregunta, fragmentos, max_resultados=10)
-        contexto = "\n\n---\n\n".join(top_fragmentos)
-        contexto = safe_text(contexto)
+        # --- Rama general (RAG) ---
+        top_fragmentos, topic = encontrar_fragmentos_relacionados(pregunta, fragmentos, max_resultados=10)
 
-        prompt = f"""Responde SOLO usando la información del contexto.
-- Si el dato no aparece, dilo claramente y ofrece 2-3 puntos relacionados que SÍ estén en contexto.
-- Responde en **Markdown** (usa títulos, listas y tablas cuando ayuden).
-- Sé breve y claro en español.
+        # Si no hay fragmentos útiles -> NO ENCONTRADO (sin relleno)
+        if not top_fragmentos:
+            anotar_pendiente(pregunta, "No encontrado (sin fragmentos útiles)")
+            html = markdown.markdown("**No encontrado en los documentos.** Ya lo he anotado para añadir la información.")
+            return render_template("index.html", pregunta=pregunta, respuesta=Markup(html))
+
+        contexto = safe_text("\n\n---\n\n".join(top_fragmentos))
+
+        # Prompt estricto: si no está, que devuelva exactamente NO_ENCONTRADO
+        prompt = f"""Usa SOLO la información del contexto para responder.
+Si el dato no aparece, responde EXACTAMENTE: NO_ENCONTRADO
+Responde en **Markdown** (títulos, listas o tablas cuando ayuden). Sé breve y claro en español.
 
 Contexto:
 {contexto}
@@ -280,22 +314,14 @@ Pregunta:
 {pregunta}
 """
         respuesta = model.generate_content(prompt)
-        texto_respuesta = safe_text((respuesta.text or "").strip())
+        texto = safe_text((respuesta.text or "").strip())
 
-        # ¿Cubierta o pendiente?
-        es_pendiente = False
-        low = texto_respuesta.lower()
-        if not texto_respuesta:
-            es_pendiente = True; motivo = "Respuesta vacía"
-        elif "no aparece" in low or "no está en el contexto" in low or "no se encuentra en el contexto" in low:
-            es_pendiente = True; motivo = "No cubierto por el contexto"
+        if texto.strip() == "NO_ENCONTRADO" or not texto:
+            anotar_pendiente(pregunta, "No encontrado (modelo)")
+            html = markdown.markdown("**No encontrado en los documentos.** Ya lo he anotado para añadir la información.")
         else:
-            motivo = ""
+            html = markdown.markdown(texto, extensions=["extra"])
 
-        if es_pendiente:
-            anotar_pendiente(pregunta, motivo, contexto_preview=contexto)
-
-        html = markdown.markdown(texto_respuesta, extensions=["extra"])
         return render_template("index.html", pregunta=pregunta, respuesta=Markup(html))
 
     except Exception as e:
