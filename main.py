@@ -328,6 +328,17 @@ Pregunta:
         anotar_pendiente(pregunta, f"Error: {safe_text(str(e))}")
         html = markdown.markdown(f"Error al generar respuesta: {safe_text(str(e))}")
         return render_template("index.html", pregunta=pregunta, respuesta=Markup(html))
+        
+from flask import send_file
+
+@app.route("/descargar_pendientes")
+def descargar_pendientes():
+    path = os.path.join(LEES_DIR, "respuestas.docx")
+    if os.path.exists(path):
+        return send_file(path, as_attachment=True)
+    else:
+        return "Aún no hay archivo de pendientes."
+
 
 # =========================
 # Arranque (local/Render)
