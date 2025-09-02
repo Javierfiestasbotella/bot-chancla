@@ -19,6 +19,11 @@ import markdown
 
 # Word (pendientes)
 from docx import Document
+from flask import send_file
+import smtplib
+from email.message import EmailMessage
+
+
 
 # =========================
 # Utilidades
@@ -114,6 +119,51 @@ def anotar_pendiente(pregunta: str, motivo: str, contexto_preview: str = ""):
         doc.add_paragraph(safe_text(contexto_preview[:1200]))
     doc.add_paragraph("")
     doc.save(LEES_DOCX)
+        # Enviar el DOCX por email cada vez que se actualiza
+    try:
+        enviar_docx_por_email(LEES_DOCX, asunto="Pendientes del asistente - La Chancla")
+    except Exception:
+        # No interrumpir el flujo si el email falla
+        pass
+def enviar_docx_por_email(path_docx: str, asunto: str = "Pendientes del asistente"):
+    """
+    Envía el archivo DOCX por email usando SMTP con credenciales de entorno.
+    Variables requeridas:
+      EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_TO
+    """
+    host = os.getenv("EMAIL_HOST")
+    port = int(os.getenv("EMAIL_PORT", "587"))
+    user = os.getenv("EMAIL_USER")
+    pwd  = os.getenv("EMAIL_PASS")
+    to   = os.getenv("EMAIL_TO")
+
+    if not all([host, port, user, pwd, to]):
+        # Si falta config, no rompemos la app: solo salimos silenciosos
+        return
+
+    if not os.path.exists(path_docx):
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = asunto
+    msg["From"] = user
+    msg["To"] = to
+    msg.set_content("Adjunto el archivo de preguntas pendientes del asistente.")
+
+    with open(path_docx, "rb") as f:
+        data = f.read()
+    msg.add_attachment(
+        data,
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=os.path.basename(path_docx),
+    )
+
+    with smtplib.SMTP(host, port) as server:
+        server.starttls()
+        server.login(user, pwd)
+        server.send_message(msg)
+
 
 # =========================
 # Catálogo de vinos (desde fragmentos)
@@ -329,7 +379,7 @@ Pregunta:
         html = markdown.markdown(f"Error al generar respuesta: {safe_text(str(e))}")
         return render_template("index.html", pregunta=pregunta, respuesta=Markup(html))
         
-from flask import send_file
+
 
 @app.route("/descargar_pendientes")
 def descargar_pendientes():
