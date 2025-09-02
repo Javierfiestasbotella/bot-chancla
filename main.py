@@ -1,9 +1,12 @@
 import os
 import re
+import unicodedata
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime
 from difflib import get_close_matches
 
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, send_file
 from markupsafe import Markup
 
 import google.generativeai as genai
@@ -19,11 +22,9 @@ import markdown
 
 # Word (pendientes)
 from docx import Document
-from flask import send_file
-import smtplib
-from email.message import EmailMessage
 
-
+# Excel
+from openpyxl import load_workbook
 
 # =========================
 # Utilidades
@@ -33,6 +34,12 @@ def safe_text(s: str) -> str:
     if s is None:
         return ""
     return s.encode("utf-8", "ignore").decode("utf-8", "ignore")
+
+def norm(s: str) -> str:
+    """minúsculas, sin acentos/diacríticos y sin dobles espacios (para comparar)"""
+    s = safe_text(s).lower()
+    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+    return re.sub(r"\s{2,}", " ", s).strip()
 
 def chunk_text(text, size=900, overlap=200):
     text = safe_text(text)
@@ -61,8 +68,6 @@ model = genai.GenerativeModel("gemini-1.5-pro-latest")
 # =========================
 # Carga de documentos (PDF + XLSX)
 # =========================
-from openpyxl import load_workbook
-
 def leer_todos_los_xlsx_en_fragmentos(carpeta):
     frags = []
     for root, _, files in os.walk(carpeta):
@@ -94,7 +99,7 @@ if not fragmentos:
 app = Flask(__name__)
 
 # =========================
-# Persistencia de pendientes
+# Persistencia de pendientes (DOCX) + envío por email
 # =========================
 LEES_DIR = "lees_resp"
 LEES_DOCX = os.path.join(LEES_DIR, "respuestas.docx")
@@ -108,27 +113,10 @@ def asegurar_docx():
         doc.add_paragraph("")
         doc.save(LEES_DOCX)
 
-def anotar_pendiente(pregunta: str, motivo: str, contexto_preview: str = ""):
-    asegurar_docx()
-    doc = Document(LEES_DOCX)
-    doc.add_heading(datetime.now().strftime('%Y-%m-%d %H:%M'), level=2)
-    doc.add_paragraph(f"Pregunta: {safe_text(pregunta)}")
-    doc.add_paragraph(f"Motivo: {safe_text(motivo)}")
-    if contexto_preview:
-        doc.add_paragraph("Contexto usado (preview):")
-        doc.add_paragraph(safe_text(contexto_preview[:1200]))
-    doc.add_paragraph("")
-    doc.save(LEES_DOCX)
-        # Enviar el DOCX por email cada vez que se actualiza
-    try:
-        enviar_docx_por_email(LEES_DOCX, asunto="Pendientes del asistente - La Chancla")
-    except Exception:
-        # No interrumpir el flujo si el email falla
-        pass
 def enviar_docx_por_email(path_docx: str, asunto: str = "Pendientes del asistente"):
     """
     Envía el archivo DOCX por email usando SMTP con credenciales de entorno.
-    Variables requeridas:
+    Requiere variables:
       EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_TO
     """
     host = os.getenv("EMAIL_HOST")
@@ -138,8 +126,7 @@ def enviar_docx_por_email(path_docx: str, asunto: str = "Pendientes del asistent
     to   = os.getenv("EMAIL_TO")
 
     if not all([host, port, user, pwd, to]):
-        # Si falta config, no rompemos la app: solo salimos silenciosos
-        return
+        return  # si falta config, no rompemos
 
     if not os.path.exists(path_docx):
         return
@@ -164,6 +151,23 @@ def enviar_docx_por_email(path_docx: str, asunto: str = "Pendientes del asistent
         server.login(user, pwd)
         server.send_message(msg)
 
+def anotar_pendiente(pregunta: str, motivo: str, contexto_preview: str = ""):
+    asegurar_docx()
+    doc = Document(LEES_DOCX)
+    doc.add_heading(datetime.now().strftime('%Y-%m-%d %H:%M'), level=2)
+    doc.add_paragraph(f"Pregunta: {safe_text(pregunta)}")
+    doc.add_paragraph(f"Motivo: {safe_text(motivo)}")
+    if contexto_preview:
+        doc.add_paragraph("Contexto usado (preview):")
+        doc.add_paragraph(safe_text(contexto_preview[:1200]))
+    doc.add_paragraph("")
+    doc.save(LEES_DOCX)
+
+    # Enviar siempre el DOCX actualizado por email
+    try:
+        enviar_docx_por_email(LEES_DOCX, asunto="Pendientes del asistente - La Chancla")
+    except Exception:
+        pass  # no interrumpir si falla el correo
 
 # =========================
 # Catálogo de vinos (desde fragmentos)
@@ -173,7 +177,7 @@ def construir_catalogo_vinos(fragmentos):
     for frag in fragmentos:
         lines = [l.strip() for l in frag.splitlines()]
         for i, line in enumerate(lines):
-            if "📍" in line and ("D.O." in line or "D.O" in line or "Rioja" in line or "Ribeiro" in line or "Tierras" in line):
+            if "📍" in line and ("D.O." in line or "D.O" in line or "rioja" in line.lower() or "ribeiro" in line.lower() or "tierras" in line.lower()):
                 name = ""
                 j = i - 1
                 while j >= 0 and not name:
@@ -233,34 +237,37 @@ def markdown_tabla_vinos(vinos):
     return "\n".join([cab] + filas)
 
 def es_pregunta_de_vinos(p):
-    p = p.lower()
-    claves = ["vino", "vinos", "carta de vinos", "tinto", "blanco", "rosado", "espumoso", "cava"]
+    p = norm(p)
+    claves = ["vino","vinos","tinto","blanco","rosado","espumoso","cava","rioja","ribeiro","ronda","malagueno","malagueño"]
     return any(c in p for c in claves)
 
 # =========================
-# Clasificación de tema + expansión de consulta
+# Clasificación de tema + expansión
 # =========================
 TOPICS = {
-    "staff": {"trabajador", "trabajadores", "personal", "camarero", "camareros", "cocina", "cocinero", "cocineros", "responsable", "encargado", "plantilla", "funciones"},
-    "uniform": {"uniforme", "vestimenta", "polo", "camiseta", "pantalon", "zapatos", "calzado", "zapatillas", "ropa"},
-    "payments": {"cobrar", "cobro", "pago", "pagos", "caja", "arqueo", "cierre", "tpv", "datofono", "datáfono", "efectivo", "tarjeta", "bizum", "factura", "ticket", "propina", "nidex"},
-    "schedule": {"horario", "turno", "turnos", "entrada", "llegada", "salida", "descanso", "viernes"},
-    "vinos": {"vino", "vinos", "tinto", "blanco", "rosado", "cava", "espumoso", "rioja", "ribeiro", "ronda", "malagueño"},
+    "staff": {"personal","trabajador","trabajadores","trabajadora","empleado","empleados","equipo",
+              "plantilla","camarero","camareros","cocina","cocinero","cocineros","chef",
+              "responsable","encargado","funciones","puestos","tareas","rrhh"},
+    "uniform": {"uniforme","uniformes","vestimenta","ropa","polo","camiseta","pantalon","zapatos","calzado","zapatillas"},
+    "payments": {"cobrar","cobro","cobros","pago","pagos","caja","arqueo","cuadre","cierre",
+                 "tpv","datofono","datafono","efectivo","tarjeta","bizum","factura","ticket","nidex"},
+    "schedule": {"horario","turno","turnos","entrada","llegada","salida","descanso","viernes"},
+    "vinos": {"vino","vinos","tinto","blanco","rosado","cava","espumoso","rioja","ribeiro","ronda","malagueno","malagueño"},
 }
 
 EXPANSIONES = {
-    "payments": ["cuadre de caja", "cierre de caja", "arqueo", "cómo cobramos", "formas de pago", "facturación"],
-    "staff": ["equipo", "funciones del personal", "responsabilidades", "organización"],
-    "uniform": ["ropa de trabajo", "normas de vestimenta"],
-    "schedule": ["apertura", "cierre", "descansos"]
+    "payments": ["cuadre de caja","cierre de caja","arqueo","formas de pago","como cobramos","facturacion"],
+    "staff": ["equipo","funciones del personal","responsabilidades","organizacion del personal","plantilla"],
+    "uniform": ["ropa de trabajo","normas de vestimenta"],
+    "schedule": ["apertura","cierre","descansos"]
 }
 
-BEBIDAS_PRECIOS = {"refresco", "coca", "fanta", "aquarius", "nestea", "ginger", "bitter", "sangria", "cerveza", "botella", "copa", "jarra", "cafe", "té", "infusion"}
+BEBIDAS_PRECIOS = {"refresco","cocacola","fanta","aquarius","nestea","ginger","bitter","sangria","cerveza",
+                   "botella","copa","jarra","cafe","te","infusion","precio","precios","€"}
 
 def detectar_topic(pregunta: str) -> str:
-    p = pregunta.lower()
-    mejor = ""
-    puntos = 0
+    p = norm(pregunta)
+    mejor, puntos = "", 0
     for t, kws in TOPICS.items():
         score = sum(1 for k in kws if k in p)
         if score > puntos:
@@ -272,10 +279,10 @@ def expand_query(pregunta: str, topic: str) -> str:
     return (pregunta + " " + " ".join(ex)).strip() if ex else pregunta
 
 def es_fragmento_de_precios(frag: str) -> bool:
-    if "€" in frag: return True
-    if re.search(r"\d+,\d{2}\s*€", frag): return True
-    low = frag.lower()
-    return any(w in low for w in BEBIDAS_PRECIOS)
+    f = norm(frag)
+    if "€" in frag or re.search(r"\d+,\d{2}\s*€", frag):
+        return True
+    return any(w in f for w in BEBIDAS_PRECIOS)
 
 # =========================
 # Búsqueda con penalizaciones/bonos por tema
@@ -295,15 +302,13 @@ def encontrar_fragmentos_relacionados(pregunta, fragmentos, max_resultados=8):
     sims_c = linear_kernel(tfidf_c[-1], tfidf_c[:-1]).flatten()
     sims = 0.6 * sims_w + 0.4 * sims_c
 
-    # Ajustes por tema: bono por palabras del tema y penalización por “precios/bebidas”
+    # Ajustes por tema
     ajustadas = []
     for i, frag in enumerate(fragmentos):
         score = sims[i]
-        low = frag.lower()
-        if topic in {"staff", "uniform", "payments"}:
-            if es_fragmento_de_precios(frag):
-                score -= 0.15
-        # bono si contiene alguna palabra del topic
+        low = norm(frag)
+        if topic in {"staff", "uniform", "payments"} and es_fragmento_de_precios(frag):
+            score -= 0.15
         for k in TOPICS.get(topic, []):
             if k in low:
                 score += 0.05
@@ -312,7 +317,6 @@ def encontrar_fragmentos_relacionados(pregunta, fragmentos, max_resultados=8):
     ajustadas.sort(key=lambda x: x[0], reverse=True)
     top = ajustadas[:max_resultados]
 
-    # Si el mejor score es muy bajo, devolvemos vacío para forzar “No encontrado”
     if not top or top[0][0] < 0.03:
         return [], topic
     return [fragmentos[i] for _, i in top], topic
@@ -343,8 +347,6 @@ def preguntar():
 
         # --- Rama general (RAG) ---
         top_fragmentos, topic = encontrar_fragmentos_relacionados(pregunta, fragmentos, max_resultados=10)
-
-        # Si no hay fragmentos útiles -> NO ENCONTRADO (sin relleno)
         if not top_fragmentos:
             anotar_pendiente(pregunta, "No encontrado (sin fragmentos útiles)")
             html = markdown.markdown("**No encontrado en los documentos.** Ya lo he anotado para añadir la información.")
@@ -352,7 +354,6 @@ def preguntar():
 
         contexto = safe_text("\n\n---\n\n".join(top_fragmentos))
 
-        # Prompt estricto: si no está, que devuelva exactamente NO_ENCONTRADO
         prompt = f"""Usa SOLO la información del contexto para responder.
 Si el dato no aparece, responde EXACTAMENTE: NO_ENCONTRADO
 Responde en **Markdown** (títulos, listas o tablas cuando ayuden). Sé breve y claro en español.
@@ -367,7 +368,7 @@ Pregunta:
         texto = safe_text((respuesta.text or "").strip())
 
         if texto.strip() == "NO_ENCONTRADO" or not texto:
-            anotar_pendiente(pregunta, "No encontrado (modelo)")
+            anotar_pendiente(pregunta, "No encontrado (modelo)", contexto_preview=contexto)
             html = markdown.markdown("**No encontrado en los documentos.** Ya lo he anotado para añadir la información.")
         else:
             html = markdown.markdown(texto, extensions=["extra"])
@@ -378,9 +379,8 @@ Pregunta:
         anotar_pendiente(pregunta, f"Error: {safe_text(str(e))}")
         html = markdown.markdown(f"Error al generar respuesta: {safe_text(str(e))}")
         return render_template("index.html", pregunta=pregunta, respuesta=Markup(html))
-        
 
-
+# Descarga del DOCX desde la web
 @app.route("/descargar_pendientes")
 def descargar_pendientes():
     path = os.path.join(LEES_DIR, "respuestas.docx")
@@ -389,6 +389,18 @@ def descargar_pendientes():
     else:
         return "Aún no hay archivo de pendientes."
 
+# Salud y diagnóstico
+@app.route("/health")
+def health():
+    return "ok"
+
+@app.route("/_routes")
+def list_routes():
+    output = []
+    for rule in app.url_map.iter_rules():
+        methods = ",".join(sorted(m for m in rule.methods if m not in ("HEAD","OPTIONS")))
+        output.append(f"{methods:10s} {rule.rule}")
+    return "<pre>" + "\n".join(sorted(output)) + "</pre>"
 
 # =========================
 # Arranque (local/Render)
