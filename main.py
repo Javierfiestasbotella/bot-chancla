@@ -116,8 +116,7 @@ def asegurar_docx():
 def enviar_docx_por_email(path_docx: str, asunto: str = "Pendientes del asistente"):
     """
     Envía el archivo DOCX por email usando SMTP con credenciales de entorno.
-    Requiere variables:
-      EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_TO
+    Requiere variables: EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_TO
     """
     host = os.getenv("EMAIL_HOST")
     port = int(os.getenv("EMAIL_PORT", "587"))
@@ -126,30 +125,36 @@ def enviar_docx_por_email(path_docx: str, asunto: str = "Pendientes del asistent
     to   = os.getenv("EMAIL_TO")
 
     if not all([host, port, user, pwd, to]):
-        return  # si falta config, no rompemos
-
+        print("[EMAIL] Falta configuración EMAIL_*")
+        return
     if not os.path.exists(path_docx):
+        print(f"[EMAIL] No existe DOCX: {path_docx}")
         return
 
-    msg = EmailMessage()
-    msg["Subject"] = asunto
-    msg["From"] = user
-    msg["To"] = to
-    msg.set_content("Adjunto el archivo de preguntas pendientes del asistente.")
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = asunto
+        msg["From"] = user
+        msg["To"] = to
+        msg.set_content("Adjunto el archivo de preguntas pendientes del asistente.")
 
-    with open(path_docx, "rb") as f:
-        data = f.read()
-    msg.add_attachment(
-        data,
-        maintype="application",
-        subtype="vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=os.path.basename(path_docx),
-    )
+        with open(path_docx, "rb") as f:
+            data = f.read()
+        msg.add_attachment(
+            data,
+            maintype="application",
+            subtype="vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename=os.path.basename(path_docx),
+        )
 
-    with smtplib.SMTP(host, port) as server:
-        server.starttls()
-        server.login(user, pwd)
-        server.send_message(msg)
+        with smtplib.SMTP(host, port, timeout=20) as server:
+            server.set_debuglevel(1)  # logs SMTP en Render → Events
+            server.starttls()
+            server.login(user, pwd)
+            server.send_message(msg)
+        print("[EMAIL] Envío OK (DOCX adjunto)")
+    except Exception as e:
+        print(f"[EMAIL] ERROR enviando DOCX: {e}")
 
 def anotar_pendiente(pregunta: str, motivo: str, contexto_preview: str = ""):
     asegurar_docx()
@@ -166,8 +171,8 @@ def anotar_pendiente(pregunta: str, motivo: str, contexto_preview: str = ""):
     # Enviar siempre el DOCX actualizado por email
     try:
         enviar_docx_por_email(LEES_DOCX, asunto="Pendientes del asistente - La Chancla")
-    except Exception:
-        pass  # no interrumpir si falla el correo
+    except Exception as e:
+        print(f"[EMAIL] ERROR en envío tras guardar: {e}")
 
 # =========================
 # Catálogo de vinos (desde fragmentos)
@@ -389,9 +394,57 @@ def descargar_pendientes():
     else:
         return "Aún no hay archivo de pendientes."
 
+# --- RUTAS DE PRUEBA DE EMAIL Y HEALTHZ ---
+def enviar_email_simple():
+    host = os.getenv("EMAIL_HOST")
+    port = int(os.getenv("EMAIL_PORT", "587"))
+    user = os.getenv("EMAIL_USER")
+    pwd  = os.getenv("EMAIL_PASS")
+    to   = os.getenv("EMAIL_TO")
+
+    if not all([host, port, user, pwd, to]):
+        return "Falta EMAIL_* en variables de entorno"
+
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = "Prueba SMTP desde bot-chancla"
+        msg["From"] = user
+        msg["To"] = to
+        msg.set_content("Esto es un correo de prueba sin adjunto para verificar SMTP.")
+
+        with smtplib.SMTP(host, port, timeout=20) as server:
+            server.set_debuglevel(1)  # ver diálogo SMTP en Events
+            server.starttls()
+            server.login(user, pwd)
+            server.send_message(msg)
+        return "Prueba enviada (revisa tu email)"
+    except Exception as e:
+        return f"ERROR prueba SMTP: {e}"
+
+@app.route("/test_email")
+def test_email():
+    return enviar_email_simple()
+
+@app.route("/enviar_pendientes")
+def enviar_pendientes():
+    path = os.path.join(LEES_DIR, "respuestas.docx")
+    if os.path.exists(path):
+        try:
+            enviar_docx_por_email(path, asunto="Pendientes del asistente - La Chancla")
+            return "DOCX enviado (revisa tu email)"
+        except Exception as e:
+            return f"ERROR enviando DOCX: {e}"
+    else:
+        return "No hay DOCX en el servidor todavía."
+
 # Salud y diagnóstico
 @app.route("/health")
 def health():
+    return "ok"
+
+# Render usa /healthz; añadimos alias
+@app.route("/healthz")
+def healthz():
     return "ok"
 
 @app.route("/_routes")
